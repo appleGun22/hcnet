@@ -11,13 +11,13 @@ if (CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
 endif()
 
 # dependencies
-if(NOT DEFINED hcnet_DIR)
-    message(FATAL_ERROR "You must set hcnet_DIR to the location of hcnet's folder")
+if(NOT DEFINED hcnet_directory)
+    message(FATAL_ERROR "You must set hcnet_directory to the location of hcnet's folder")
 endif()
 
 find_package(fmt CONFIG REQUIRED)
 
-find_package(hcnet CONFIG REQUIRED HINTS ${hcnet_DIR})
+find_package(hcnet CONFIG REQUIRED HINTS ${hcnet_directory})
 find_library(miniupnpc_library NAMES miniupnpc HINTS ${CMAKE_PREFIX_PATH})
 find_package(asio REQUIRED CONFIG)
 
@@ -26,7 +26,7 @@ add_executable(host src/host.cpp)
 
 target_include_directories(host
 		PUBLIC "${PROJECT_SOURCE_DIR}/include"
-		PUBLIC "${hcnet_DIR}/include")
+		PUBLIC "${hcnet_directory}/include")
 
 target_link_libraries(host
 		PUBLIC fmt::fmt
@@ -38,7 +38,7 @@ add_executable(client src/client.cpp)
 
 target_include_directories(client
 		PUBLIC "${PROJECT_SOURCE_DIR}/include"
-		PUBLIC "${hcnet_DIR}/include")
+		PUBLIC "${hcnet_directory}/include")
 
 target_link_libraries(client
 		PUBLIC fmt::fmt
