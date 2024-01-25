@@ -69,12 +69,15 @@ public:
 			}
 		}
 
-		// if all potential elements are active, add to the back
+		/* vvv - ill defined - vvv
+  
 		data_vec.push_back(new_p);
 		alive_vec.push_back(&data_vec.back());
 
 		_size.store(size + 1);
 		return size;
+		*/
+		return -1; // should never reach and return this
 	}
 
 	inline void initiate_delete() {
