@@ -24,7 +24,7 @@ class net_exclusive_dual_vector {
 public:
 
 	net_exclusive_dual_vector(const int size) : max_size(size) {
-		data_vec.reserve(max_size);
+		data_vec.resize(max_size);
 		alive_vec.reserve(max_size);
 	}
 
