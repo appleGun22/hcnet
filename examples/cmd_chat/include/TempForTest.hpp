@@ -7,6 +7,8 @@
 #include "fmt/core.h"
 #include "fmt/format.h"
 
+#include <iostream>
+
 #define RETURN_ON_KEY_PRESS \
 	std::ignore = std::getchar(); \
 	return 1;
@@ -31,7 +33,7 @@ constexpr u32 UNIQUE_APP_ID = djb2_hash(APP_NAME);
 
 str forge_coin(const str& ipstr) {
 	str coin = "";
-	std::istringstream ssip(ipstr);
+	std::istringstream ssip{ ipstr };
 
 	if (ipstr.find('.') != str::npos) { // IPv4
 		for (str segment; std::getline(ssip, segment, '.'); ) {
@@ -65,7 +67,7 @@ str melt_coin(const str& s) {
 		}
 	}
 	else {
-		return melt;
+		return str{};
 	}
 
 	melt.pop_back();

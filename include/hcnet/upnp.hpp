@@ -1,9 +1,10 @@
 #pragma once
 
 #include "canyon.hpp"
+#include "error.hpp"
+
 #include <miniupnpc/miniupnpc.h>
 #include <miniupnpc/upnpcommands.h>
-#include "error.hpp"
 
 #include <string.h>
 
@@ -11,45 +12,42 @@ namespace net
 {
     class Upnp {
     public:
-        // WAN_port and LAN_port [6 bytes]
-        // desc up to [80 bytes]
-        // protocol "TCP" or "UDP" only! [4 bytes]
-        Upnp(cstr WAN_port, cstr LAN_port, cstr desc, cstr protocol = "TCP") :
-            m_WAN_port(WAN_port), m_LAN_port(LAN_port), m_description(desc), m_protocol(protocol)
+        
+        Upnp(u16 WAN_port, u16 LAN_port, const char description[80]) noexcept
         {
-
+            itoa(WAN_port, m_WAN_port, 10);
+            itoa(LAN_port, m_LAN_port, 10);
+            strcpy(m_description, description);
         }
 
-        ~Upnp() {
-            // free upnp stuff
+        ~Upnp() noexcept {
             freeUPNPDevlist(upnp_dev);
             FreeUPNPUrls(&upnp_urls);
         }
 
-        std::error_code Discover();
-        std::error_code Get_valid_IGD();
-        std::error_code Pull_wan_address();
-        std::error_code Add_port_mapping();
-        bool Port_mapping_exists();
+        std::error_code Discover() noexcept;
+        std::error_code Get_valid_IGD() noexcept;
+        std::error_code Pull_wan_address() noexcept;
+        std::error_code Add_port_mapping() noexcept;
+        bool Port_mapping_exists() noexcept;
 
     public:
-        char LAN_address[64]{}; // C string of your LAN address
-        char WAN_address[64]{}; // C string of your WAN address (ip)
+        char LAN_address[64];
+        char WAN_address[64];
 
     private:
         UPNPDev* upnp_dev = nullptr;
         UPNPUrls upnp_urls{};
         IGDdatas upnp_data{};
 
-        cstr m_WAN_port;
-        cstr m_LAN_port;
-        cstr m_description;
-        cstr m_protocol;
+        char m_WAN_port[6];
+        char m_LAN_port[6];
+        char m_description[80];
     };
 
     // Discover UPnP devices on the network.
     // - Returns 0 on success.
-    std::error_code Upnp::Discover() {
+    std::error_code Upnp::Discover() noexcept {
         int err = 0;
         upnp_dev = upnpDiscover(
             2000, // time to wait (milliseconds)
@@ -61,26 +59,26 @@ namespace net
             &err); // error
 
         if (err != 0) {
-            return _lib::make_ec_upnp(net::upnp_error::discover);
+            return detail::make_ec_upnp(net::upnp_error::discover);
         }
 
         return {};
     }
 
-    std::error_code Upnp::Get_valid_IGD() {
+    std::error_code Upnp::Get_valid_IGD() noexcept {
         // err = 1, A valid connected IGD has been found, anything else is an error
         int err = UPNP_GetValidIGD(upnp_dev, &upnp_urls, &upnp_data, LAN_address, sizeof(LAN_address));
 
         if (err != 1) {
             switch (err) {
             case 0:
-                return _lib::make_ec_upnp(net::upnp_error::IGD_not_found);
+                return detail::make_ec_upnp(net::upnp_error::IGD_not_found);
             case 2:
-                return _lib::make_ec_upnp(net::upnp_error::IGD_not_connected);
+                return detail::make_ec_upnp(net::upnp_error::IGD_not_connected);
             case 3:
-                return _lib::make_ec_upnp(net::upnp_error::upnp_without_IGD);
+                return detail::make_ec_upnp(net::upnp_error::upnp_without_IGD);
             default:
-                return _lib::make_ec_upnp(net::upnp_error::unspecified);
+                return detail::make_ec_upnp(net::upnp_error::unspecified);
             }
         }
 
@@ -88,30 +86,41 @@ namespace net
     }
 
     // Obtain WAN IP address
-    std::error_code Upnp::Pull_wan_address() {
+    std::error_code Upnp::Pull_wan_address() noexcept {
         int err = UPNP_GetExternalIPAddress(upnp_urls.controlURL, upnp_data.first.servicetype, WAN_address);
 
         if (err != 0) {
-            return _lib::make_ec_upnp(net::upnp_error::pull_wan_address);
+            return detail::make_ec_upnp(net::upnp_error::pull_wan_address);
         }
 
         return {};
     }
 
-    std::error_code Upnp::Add_port_mapping() {
+    std::error_code Upnp::Add_port_mapping() noexcept {
         int err = UPNP_AddPortMapping(
-            upnp_urls.controlURL, upnp_data.first.servicetype, m_WAN_port, m_LAN_port, LAN_address, m_description, m_protocol,
+            upnp_urls.controlURL, upnp_data.first.servicetype, m_WAN_port, m_LAN_port, LAN_address, m_description, 
+            "TCP",
             nullptr, // remote (peer) host address or nullptr for no restriction
             "0"); // lease duration (in seconds), zero for permanent
 
         if (err != 0) {
-            return _lib::make_ec_upnp(net::upnp_error::port_mapping);
+            return detail::make_ec_upnp(net::upnp_error::port_mapping);
+        }
+
+        err = UPNP_AddPortMapping(
+            upnp_urls.controlURL, upnp_data.first.servicetype, m_WAN_port, m_LAN_port, LAN_address, m_description,
+            "UDP",
+            nullptr, // remote (peer) host address or nullptr for no restriction
+            "0"); // lease duration (in seconds), zero for permanent
+
+        if (err != 0) {
+            return detail::make_ec_upnp(net::upnp_error::port_mapping);
         }
 
         return {};
     }
 
-    bool Upnp::Port_mapping_exists() {
+    bool Upnp::Port_mapping_exists() noexcept {
         size_t index = 0;
         while (true) {
             char wan_port[6] = "",
@@ -145,8 +154,7 @@ namespace net
             else if (
                 !strcmp(m_WAN_port, wan_port) && 
                 !strcmp(m_LAN_port, lan_port) && 
-                !strcmp(m_description, description) &&
-                !strcmp(m_protocol, protocol))
+                !strcmp(m_description, description))
             {
                 return true;
             }

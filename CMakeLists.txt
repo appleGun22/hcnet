@@ -8,16 +8,19 @@ list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_LIST_DIR}/cmake)
 
 add_library(hcnet INTERFACE)
 
-target_include_directories(hcnet INTERFACE
-        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
-        $<INSTALL_INTERFACE:include/hcnet>)
-
 find_library(miniupnpc_library
         NAMES miniupnpc)
 
 find_package(asio REQUIRED CONFIG)
 
 add_dependencies(hcnet asio::asio miniupnpc)
+
+target_include_directories(
+        asio INTERFACE
+        miniupnpc INTERFACE
+        hcnet INTERFACE
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
+        $<INSTALL_INTERFACE:include/hcnet>)
 
 target_link_libraries(hcnet
         INTERFACE miniupnpc_library

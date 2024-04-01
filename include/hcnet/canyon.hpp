@@ -4,9 +4,8 @@
 // STANDARD
 
 #include <string>
-#include <queue>
-#include <iostream>
 #include <concepts>
+#include <expected>
 
 // EXTERNAL
 #define ASIO_STANDALONE
@@ -16,32 +15,16 @@
 #define _WIN32_WINNT 0x0A00
 #endif
 
-#include <asio.hpp>
+#include "asio.hpp"
+#include "gef.hpp"
+#include "concurrentqueue/blockingconcurrentqueue.h"
 
 // lib
-#include "better_types.hpp"
 #include "error.hpp"
-#include "ts_deque.hpp"
-#include "mut_order_array.hpp"
 
 using namespace asio::ip;
 
-using str = std::string;
-using cstr = const char*;
-
-#define NET_TO_CLIENT_MESSAGES \
-	net_client_disconnect, \
-	net_server_full, \
-	net_new_client, \
-	net_unknown_msg_type
-
 namespace net {
-
-	struct net_enum {
-		enum Type : i32 {
-			NET_TO_CLIENT_MESSAGES
-		};
-	};
 
 	// mutable buffer, can modify pointed data
 	using mut_buf = asio::mutable_buffer;
@@ -49,90 +32,176 @@ namespace net {
 	// constant buffer, cannot modify pointed data
 	using const_buf = asio::const_buffer;
 
+	template <typename T>
+	struct msg;
 
-	// *? get rid of virtuals (IS_NET_MSG)
-
-	// Every class that may be sent, should derive from `IS_NET_MSG`
-	class IS_NET_MSG {
-	public:
-		virtual ~IS_NET_MSG() {};
-
-		virtual std::vector<const_buf> custom_const_buf() const = 0;
-
-		virtual std::vector<mut_buf> custom_mut_buf() const = 0;
-	};
-
-
-	template <typename Buf, std::same_as<Buf> ...Buffers>
-	constexpr std::vector<Buf> build_custom_buf_seq(Buffers ...buf_seq) noexcept {
-		if constexpr (std::is_same_v<Buf, const_buf>) {
-			return { const_buf{}, std::forward<Buf>(buf_seq)... }; // empty buf in the beginning, to be replaced with header buf
-		}
-		else if (std::is_same_v<Buf, mut_buf>) {
-			return { std::forward<Buf>(buf_seq)... };
-		}
-		else {
-			static_assert(std::is_same_v<Buf, mut_buf> || std::is_same_v<Buf, const_buf>, "buffer sequence is required to be either mut_buf or const_buf");
-		}
-	}
+	template <typename T>
+	using msg_ref = msg<T const&>;
 
 	template <class T>
 	struct vectorize_msg {};
 
 
-	struct header {
-		header() {}
-		// `size` of 0 means header only message
-		header(u64 size, i32 msg_type, i32 from_id = 0) : size(size), msg_type(msg_type), from_id(from_id) {}
 
-		u64 size;     // size variable
-		i32 msg_type; // user defined type of the incoming message
-		i32 from_id; // incoming message from uid
+	struct header_client_TCP {
+		inline static constexpr size_t header_size = 6;
 
-		const_buf to_const_buf() const {
-			return const_buf(this, sizeof(*this));
+		u32 size;
+		i16 msg_type;
+	};
+
+	struct header_server_TCP {
+		inline static constexpr size_t header_size = 8;
+
+		u32 size;
+		i16 msg_type;
+		i16 from_id;
+	};
+
+	struct header_client_UDP {
+		inline static constexpr size_t header_size = 2;
+
+		i16 msg_type;
+	};
+
+	struct header_server_UDP {
+		inline static constexpr size_t header_size = 4;
+
+		i16 msg_type;
+		i16 from_id;
+	};
+
+	template <typename Buf, typename Header>
+		requires (std::same_as<Buf, mut_buf> || std::same_as<Buf, const_buf>)
+	static Buf header_to(Header& h) noexcept {
+		return { &h, Header::header_size };
+	}
+
+	// Creates a vector of buffers
+	// 
+	// * A sequence of const_buf's includes the header buffer as its first buffer, because that's what you initially read, the header
+	// and sets the header size (accumulates all the sizes of the vectorized buffers)
+	// 
+	// * A sequence of mut_buf's just forwards the vectorized buffers `...Buffers`
+	template <bool IncludeHeaderBuf, typename Buf, std::same_as<Buf> ...Buffers>
+		requires (std::same_as<Buf, mut_buf> || std::same_as<Buf, const_buf>)
+	constexpr std::vector<Buf> build_custom_buf_seq(Buffers ...buf_seq) noexcept {
+		if constexpr (IncludeHeaderBuf) {
+			return { Buf{}, std::forward<Buf>(buf_seq)... };
 		}
+		else {
+			return { std::forward<Buf>(buf_seq)... };
+		}
+	}
 
-		mut_buf to_mut_buf() {
-			return mut_buf(this, sizeof(*this));
+	class any_msg {
+	public:
+		virtual ~any_msg() noexcept {};
+
+		virtual std::vector<const_buf> const_buf_seq(i16&) const noexcept = 0;
+
+		virtual std::vector<mut_buf> mut_buf_seq() noexcept = 0;
+
+		virtual std::vector<mut_buf> mut_buf_seq_with_header(i16&) noexcept = 0;
+
+		// cast to specific msg instance
+		template <typename U, typename M = msg<U>, typename Self>
+			requires(std::derived_from<M, any_msg>)
+		constexpr auto& as(this Self& self) noexcept {
+			if constexpr (std::is_const_v<Self>) {
+				return static_cast<M const&>(self);
+			}
+			else {
+				return static_cast<M&>(self);
+			}
 		}
 	};
 
-	struct PACKET {
+	enum class protocol : i8 {
+		tcp,
+		udp
+	};
 
-		//! `h` must not be a nullptr.
-		//! `m` can be a nullptr, if it is, only `h` will be sent.
-		PACKET(std::unique_ptr<header> h, std::unique_ptr<IS_NET_MSG> m) : h(std::move(h)), m(std::move(m)) {
-			
+	template <typename Header>
+	struct packet_tcp {
+	public:
+
+		packet_tcp(packet_tcp&) = delete;
+		packet_tcp(packet_tcp const&) = delete;
+		packet_tcp(packet_tcp&&) = default;
+
+		packet_tcp() noexcept {}
+
+		packet_tcp(i16 msg_t) noexcept :
+			h(Header{ .msg_type{msg_t} }), m(gef::nullopt)
+		{}
+
+		packet_tcp(gef::unique_ref<any_msg> m) noexcept :
+			m(std::move(m))
+		{}
+
+		~packet_tcp() noexcept {}
+
+		constexpr bool is_header_only() const noexcept {
+			return m.is_null(); // no message content
 		}
 
-		// an empty packet (yet to be defined)
-		PACKET() : h(new header), m(nullptr) {
+		std::vector<const_buf> const_buf_seq() noexcept {
+			return m.map_or_else(
+				[&](gef::unique_ref<any_msg> const& m) -> std::vector<const_buf> {
+					auto vec = m->const_buf_seq(h.msg_type);
 
+					h.size = static_cast<u32>(std::ranges::fold_left(vec.begin() + 1, vec.end(), 0, [](size_t&& sum, const_buf& next) { return sum + next.size(); }));
+
+					new (&vec[0]) const_buf(header_to<const_buf>(h));
+
+					return vec;
+				},
+				[&]() -> std::vector<const_buf> {
+					return { header_to<const_buf>(h) };
+				}
+			);
 		}
 
-		~PACKET() {}
+	public:
+		gef::option<gef::unique_ref<any_msg>> m;
+		Header h;
+	};
 
-		inline auto const_buf_seq() const {
-			auto vec = m->custom_const_buf();
-			vec.front() = h->to_const_buf();
+	template <typename Header>
+	struct packet_udp {
+	public:
+
+		packet_udp(packet_udp&) = delete;
+		packet_udp(packet_udp const&) = delete;
+		packet_udp(packet_udp&&) = default;
+
+		packet_udp() noexcept {}
+
+		packet_udp(gef::unique_ref<any_msg> m) noexcept :
+			m(std::move(m))
+		{}
+
+		~packet_udp() noexcept {}
+
+		std::vector<const_buf> const_buf_seq() noexcept {
+			auto vec = m->const_buf_seq(h.msg_type);
+
+			new (&vec[0]) const_buf(header_to<const_buf>(h));
 
 			return vec;
 		}
 
-		inline auto mut_buf_seq() const {
-			return m->custom_mut_buf();
+		std::vector<mut_buf> mut_buf_seq() noexcept {
+			auto vec = m->mut_buf_seq_with_header(h.msg_type);
+
+			new (&vec[0]) mut_buf(header_to<mut_buf>(h));
+
+			return vec;
 		}
 
-		std::unique_ptr<header> h;
-		std::unique_ptr<IS_NET_MSG> m;
-	};
-
-	template <class Wire>
-	struct msg_ext {
-		msg_ext(std::unique_ptr<PACKET> p, Wire* w) : p(std::move(p)), from_wire(w) {}
-
-		std::unique_ptr<PACKET> p;
-		Wire* from_wire;
+	public:
+		gef::unique_ref<any_msg> m;
+		Header h;
 	};
 }

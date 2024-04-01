@@ -1,311 +1,428 @@
 #pragma once
 
 #include "canyon.hpp"
+#include "socket.hpp"
 
 namespace net {
 
-template <class UserHost>
+template <class Hoster>
 class Host;
 
-template <class UserHost>
+template <class Hoster>
 class Wire {
-public:
-	using self_t = Wire<UserHost>;
+private:
 
-	Wire(tcp::socket&& s) : socket(std::move(s)) {}
+	using self_t = Host<Hoster>::WIRE;
 
-	void ReadClientInfo() {
-		std::unique_ptr<self_t> self_life(this);
+	friend Host<Hoster>;
+	friend SocketTCP<self_t, std::shared_ptr, header_server_TCP, header_client_TCP>;
+	friend SocketUDP<self_t, std::shared_ptr, header_server_UDP, header_client_UDP>;
 
-		auto p = std::make_unique<PACKET>();
 
-		auto Pp = p.get();
-		asio::async_read(socket, Pp->h->to_mut_buf(),
-			[this, p = std::move(p), self_life = std::move(self_life)](asio::error_code ec, size_t s) mutable {
-				if (ec) {
-					Close(nullptr);
-					return;
-				}
-				
-				p->m = std::move(host_class->builder(*p->h));
+	std::jthread self_thread;
 
-				if (p->m == nullptr) {
-					Close(nullptr);
-					return;
-				}
+	SocketTCP<self_t, std::shared_ptr, header_server_TCP, header_client_TCP> tcp_socket;
+	SocketUDP<self_t, std::shared_ptr, header_server_UDP, header_client_UDP> udp_socket;
 
-				auto Pp = p.get();
-				asio::async_read(socket, Pp->mut_buf_seq(),
-					[this, p = std::move(p), self_life = std::move(self_life)](asio::error_code ec, size_t) mutable {
-						if (!ec && host_class->filter_client_info(p->m.get())) {
-							WriteHostInfo(std::move(self_life), std::move(p));
-						}
-						else {
-							Close(nullptr);
-						}
-					});
-			});
-	}
+	i16 m_id{ -1 };
 
-	void WriteHostInfo(std::unique_ptr<self_t> self_life, std::unique_ptr<PACKET> cinfo_packet) {
+	bool connected;
 
-		auto hinfo = std::make_unique<typename UserHost::HostInfo>();
-
-		auto Phinfo = hinfo.get();
-		asio::async_write(socket, Phinfo->custom_const_buf(*host_class),
-			[this, hinfo = std::move(hinfo), cinfo_packet = std::move(cinfo_packet), self_life = std::move(self_life)](asio::error_code ec, size_t) mutable {
-				if (ec) {
-					Close(nullptr);
-					return;
-				}
-
-				m_id = host_class->wires.insert_unchecked(self_life.release());
-
-				host_class->new_msg(std::move(cinfo_packet), *this);
-
-				ReadHeader();
-			});
-	}
-
-	void ReadHeader() {
-		auto p = std::make_unique<PACKET>();
-
-		auto Pp = p.get();
-		asio::async_read(socket, Pp->h->to_mut_buf(),
-			[this, p = std::move(p)](asio::error_code ec, size_t) mutable {
-				if (ec) {
-					Close(&ec);
-					return;
-				}
-				
-				if (p->h->size == 0) {
-					host_class->new_msg(std::move(p), *this);
-
-					ReadHeader();
-				}
-				else {
-					p->m = std::move(host_class->builder(*p->h));
-
-					if (p->m == nullptr) {
-						const auto ec = _lib::make_ec_net(net_error::unknown_msg_type);
-						Close(&ec);
-						return;
-					}
-
-					ReadBody(std::move(p));
-				}
-			});
-	}
-
-	void ReadBody(std::unique_ptr<PACKET> p) {
-		auto Pp = p.get();
-		asio::async_read(socket, Pp->m->custom_mut_buf(),
-			[this, p = std::move(p)](asio::error_code ec, size_t) mutable {
-				if (ec) {
-					Close(&ec);
-					return;
-				}
-				
-				ReadHeader();
-				host_class->new_msg(std::move(p), *this);
-			});
-	}
-
-	void Send(std::shared_ptr<PACKET> _msg) {
-		asio::post(socket.get_executor(),
-			[this, _msg = std::move(_msg)]() {
-				bool was_empty = write_queue.empty();
-				write_queue.emplace(std::move(_msg));
-
-				if (was_empty) {
-					Write();
-				}
-			});
-	}
-
-	void Write() {
-		const std::shared_ptr<PACKET>& _msg = write_queue.front();
-
-		auto f =
-		[this](asio::error_code ec, size_t) {
-			if (ec) {
-				Close(&ec);
-			}
-			else {
-				if (!write_queue.pop_check_empty()) {
-					Write();
-				}
-			}
-		};
-
-		if (_msg->m == nullptr) { // empty message, only header will be sent
-			asio::async_write(socket, _msg->h->to_const_buf(), f);
-		}
-		else {
-			asio::async_write(socket, _msg->const_buf_seq(), f);
-		}
-	}
-
-	void Close(const asio::error_code* ec) noexcept {
-		if (socket.is_open()) {// maybe use shutdown() and check for asio::error::eof(?) in async read/write
-			socket.close();
-
-			if (ec != nullptr) {
-				host_class->on_client_dis(id(), *ec);
-			}
-		}
-	}
-
-	inline bool socket_is_open() const {
-		return socket.is_open();
-	}
+	static Hoster* running_host;
 
 public:
-	inline const i32 id() const {
-		return m_id;
-	}
+
+	using PacketTCP = Host<Hoster>::PacketTCP;
+	using PacketUDP = Host<Hoster>::PacketUDP;
+
+	using PacketTCPclient = Host<Hoster>::PacketTCPclient;
+	using PacketUDPclient = Host<Hoster>::PacketUDPclient;
+
+	struct allowed {
+		gef::unique_ref<PacketTCP> hinfo;
+		gef::unique_ref<PacketTCP> cinfo;
+		i16 id;
+	};
+
+	struct not_allowed {
+		gef::unique_ref<PacketTCP> reason;
+	};
+
+	Wire(asio::io_context& ctx, tcp::socket&& s) noexcept :
+		connected(false),
+		tcp_socket(*this, ctx, std::move(s)),
+		udp_socket(*this, ctx)
+	{}
+
+	~Wire() noexcept {}
 
 private:
-	tcp::socket socket;
-	i32 m_id{ -1 };
 
-	tsQueueMini<std::shared_ptr<PACKET>> write_queue;
+	static void Init(asio::io_context& ctx, tcp::socket&& s) noexcept {
+		auto new_wire = gef::unique_ref<self_t>::make( ctx, std::move(s) );
+
+		auto const& local_endpoint = new_wire->tcp_socket.socket.local_endpoint();
+		auto const& remote_endpoint = new_wire->tcp_socket.socket.remote_endpoint();
+
+		auto ec = new_wire->udp_socket.OpenBindConnect(
+			udp::endpoint(local_endpoint.address(), local_endpoint.port()),
+			udp::endpoint(remote_endpoint.address(), remote_endpoint.port())
+		);
+
+		if (ec) {
+			new_wire->running_host->on_error({ net_error::failed_to_connect, ec });
+			return;
+		}
+
+		auto& new_wire_ref = new_wire.get();
+
+		new_wire_ref.CinfoReadHeader(std::move(new_wire));
+	}
+
+	void CinfoReadHeader(gef::unique_ref<self_t> lifetime) noexcept {
+		auto p = gef::unique_ref<PacketTCPclient>::make();
+
+		auto buf = header_to<mut_buf>(p->h);
+
+		tcp_socket.socket.async_receive(buf,
+			[this, p = std::move(p), lifetime = std::move(lifetime)](asio::error_code ec, size_t) mutable {
+				if (ec) {
+					Close({ net_error::failed_to_read, ec });
+					return;
+				}
+
+				p->m.replace(builder_TCP(p->h))
+					.map_or_else(
+						[&](gef::unique_ref<any_msg>& m) {
+							CinfoReadBody(std::move(p), m.get(), std::move(lifetime));
+						},
+						[&]() {
+							Close({ net_error::unknown_msg_type, gef::nullopt });
+						});
+			});
+	}
+
+	void CinfoReadBody(gef::unique_ref<PacketTCPclient> p, any_msg& m, gef::unique_ref<self_t> lifetime) noexcept {
+
+		auto bufs = m.mut_buf_seq();
+
+		tcp_socket.socket.async_receive(bufs,
+			[this, &m, p = std::move(p), lifetime = std::move(lifetime)](asio::error_code ec, size_t) mutable {
+				if (ec) {
+					Close({ net_error::failed_to_read, ec });
+					return;
+				}
+
+				std::expected<allowed, not_allowed>
+					wire_allowed = running_host->new_client(m);
+
+				if (wire_allowed.has_value()) {
+					HinfoWrite(std::move(*wire_allowed), std::move(lifetime));
+				}
+				else {
+					auto bufs = wire_allowed.error().reason->const_buf_seq();
+
+					// send error_packet, and self destruct this wire
+					tcp_socket.socket.async_send(bufs,
+						[this, reason = std::move(wire_allowed.error().reason), lifetime = std::move(lifetime)](asio::error_code ec, size_t)
+						{});
+				}
+			});
+	}
+
+	void HinfoWrite(allowed wire_allowed, gef::unique_ref<self_t> lifetime) noexcept {
+
+		auto bufs = wire_allowed.hinfo->const_buf_seq();
+
+		tcp_socket.socket.async_send(bufs,
+			[this, wire_allowed = std::move(wire_allowed), lifetime = std::move(lifetime)](asio::error_code ec, size_t) mutable {
+				if (ec) {
+					Close({ net_error::failed_to_write, ec });
+					return;
+				}
+
+				m_id = wire_allowed.id;
+
+				running_host->wires.lock(
+					[&](auto& vec) {
+						vec.emplace_back(std::move(lifetime));
+					});
+
+				running_host->Send(std::move(wire_allowed.cinfo), m_id);
+
+				connected = true;
+
+				tcp_socket.Start();
+				udp_socket.Start();
+			});
+	}
+
+	constexpr gef::option<gef::unique_ref<any_msg>> builder_TCP(header_client_TCP const& h) noexcept {
+		return running_host->builder_TCP(h);
+	}
+
+	constexpr gef::unique_ref<any_msg> builder_UDP(size_t size) noexcept {
+		return running_host->builder_UDP(size);
+	}
+
+	constexpr void NewPacketTCP(gef::unique_ref<PacketTCPclient>&& p) noexcept {
+		running_host->new_packet_TCP(std::forward<decltype(p)>(p), m_id);
+	}
+
+	constexpr bool NewPacketUDP(gef::unique_ref<PacketUDPclient>&& p) noexcept {
+		return running_host->new_packet_UDP(std::forward<decltype(p)>(p), m_id);
+	}
+
+	void Close(error_info const& err) noexcept {
+
+		if (tcp_socket.socket.is_open()) {
+			tcp_socket.socket.shutdown(tcp::socket::shutdown_both);
+			tcp_socket.socket.close();
+
+			udp_socket.socket.close(); // udp can just be closed
+
+			connected = false;
+
+			running_host->on_close_connection(
+				m_id,
+				err.ec.and_then<error_info const&>( // ?? fails to deduce `U` (option<U>)
+					[&](auto const& ec) -> gef::option<error_info const&> {
+						return ec == asio::error::eof
+							? gef::nullopt
+							: gef::option<error_info const&>{ err };
+					}));
+		}
+	}
 
 public:
-	static UserHost* host_class;
+
+	constexpr i16 id() const noexcept {
+		return m_id;
+	}
 };
 
-template <class UserHost>
-UserHost* Wire<UserHost>::host_class;
+template <class Hoster>
+Hoster* Wire<Hoster>::running_host;
 
-template <class UserHost>
+template <class Hoster>
 class Host {
 public:
 
-	using WIRE = Wire<UserHost>;
-	using MSGEXT = msg_ext<WIRE>;
+	using PacketTCP = packet_tcp<header_server_TCP>;
+	using PacketUDP = packet_udp<header_server_UDP>;
 
-	Host(const u16 port, const i32 max_clients, UserHost& derived_from) :
+	using PacketTCPclient = packet_tcp<header_client_TCP>;
+	using PacketUDPclient = packet_udp<header_client_UDP>;
+
+	using WIRE = Wire<Hoster>;
+
+	Host(const u16 port, const i16 host_id, Hoster* derived_from) noexcept :
 		m_acceptor(m_context, tcp::endpoint(tcp::v4(), port)),
-		wires(max_clients)
+		m_host_id(host_id),
+		running(false)
 	{
-		WIRE::host_class = &derived_from;
+		WIRE::running_host = derived_from;
 	}
 
-	~Host() {
+	~Host() noexcept {
 		Stop();
 	}
 
 private:
+
+	friend WIRE;
+
 	asio::io_context m_context;
 	tcp::acceptor m_acceptor;
 	std::thread m_self_thread;
 
-	tsQueueMini<MSGEXT> m_outQ;
+	moodycamel::BlockingConcurrentQueue<gef::unique_ref<PacketTCP>> out_queue_tcp;
+	moodycamel::BlockingConcurrentQueue<gef::unique_ref<PacketUDP>> out_queue_udp;
 
-public:
-	net_exclusive_dual_vector<WIRE> wires;
+	gef::mutex<std::vector<gef::unique_ref<WIRE>>> wires;
+
+	i16 m_host_id;
+
+	bool running;
 
 public:
 	/// Starts / Restarts the host.
-	inline void Start() noexcept {
+	void Start() noexcept {
 		AcceptConnections();
 
-		m_self_thread = std::thread([this]() { m_context.run(); });
+		m_self_thread = std::thread(
+			[this]() {
+
+				running = true;
+
+				std::thread{ &Host::DequeueTCP, this }.detach();
+				std::thread{ &Host::DequeueUDP, this }.detach();
+
+				asio::error_code ec;
+				m_context.run(ec);
+
+				if (ec) {
+					access_hoster().on_error({ net_error::failed_to_run_io_context, ec });
+				}
+
+				running = false;
+
+				// 'Wake up' the wait_dequeue()'s
+				out_queue_tcp.enqueue(gef::unique_ref<PacketTCP>{ nullptr });
+				out_queue_udp.enqueue(gef::unique_ref<PacketUDP>{ nullptr });
+			});
 	}
 
 	/// Stops host.
 	/// Call Start() when you wish to restart the host.
-	inline void Stop() noexcept {
-		if (!m_context.stopped()) { m_context.stop(); }
+	void Stop() noexcept {
+		if (not m_context.stopped()) { m_context.stop(); }
 
 		if (m_self_thread.joinable()) { m_self_thread.join(); }
 	}
 
-	inline void Send(std::unique_ptr<header> h, std::unique_ptr<IS_NET_MSG> m, WIRE* skip_client = nullptr) noexcept {
-		bool was_empty = m_outQ.empty();
-		m_outQ.emplace(std::make_unique<PACKET>(std::move(h), std::move(m)), skip_client);
-
-		if (was_empty) {
-			WriteToClients();
-		}
+	constexpr i16 host_id() const noexcept {
+		return m_host_id;
 	}
 
-	inline void Send(std::unique_ptr<PACKET> p, WIRE* skip_client = nullptr) noexcept {
-		bool was_empty = m_outQ.empty();
-		m_outQ.emplace(std::move(p), skip_client);
+	constexpr bool is_running() const noexcept {
+		return running;
+	}
 
-		if (was_empty) {
-			WriteToClients();
-		}
+	void Send(gef::unique_ref<PacketTCP> p, const i16 skip_client) noexcept {
+
+		p->h.from_id = skip_client;
+
+		out_queue_tcp.enqueue(std::move(p));
+	}
+
+	void Send(gef::unique_ref<PacketUDP> p, const i16 skip_client) noexcept {
+
+		p->h.from_id = skip_client;
+
+		out_queue_udp.enqueue(std::move(p));
 	}
 
 private:
 
-	void WriteToClients() noexcept {
+	void DequeueTCP() noexcept {
 
-		do {
+		gef::unique_ref<PacketTCP> p{ nullptr };
 
-			auto& packet = m_outQ.front();
+		out_queue_tcp.wait_dequeue(p);
 
-			bool dead_clients_exist = false;
+		if (not running) {
+			return;
+		}
 
-			std::shared_ptr<PACKET> p_sh(std::move(packet.p));
+		std::shared_ptr shared_packet{ std::move(p._Ptr) };
 
-			// call end only one time, to ignore new clients that may connect while distributing the current message
-			const auto end = wires.end();
+		bool clear_dead_wires = false;
 
-			for (auto iter = wires.begin(); iter != end; ++iter) {
-				const auto& w = **iter;
+		wires.shared_lock(
+			[&](auto& vec) {
 
-				if (w == packet.from_wire) {
-					continue;
-				}
+				if (shared_packet->h.from_id == m_host_id) { // host isn't a wire, no need to check id
+					for (gef::unique_ref<WIRE> const& wire : vec) {
 
-				if (w->socket_is_open()) {
-					w->Send(p_sh);
+						if (wire->tcp_socket.socket.is_open()) {
+							wire->tcp_socket.Send(shared_packet);
+						}
+						else {
+							clear_dead_wires = true;
+						}
+					}
 				}
 				else {
-					dead_clients_exist = true;
-					wires.kill(*iter);
+					for (gef::unique_ref<WIRE> const& wire : vec) {
+
+						if (wire->id() == shared_packet->h.from_id) { // don't send back to the sender
+							continue;
+						}
+
+						if (wire->tcp_socket.socket.is_open()) {
+							wire->tcp_socket.Send(shared_packet);
+						}
+						else {
+							clear_dead_wires = true;
+						}
+					}
 				}
-			}
+			});
 
-			if (dead_clients_exist) {
-				wires.initiate_delete();
-			}
+		if (clear_dead_wires) {
+			std::thread(
+				[&]() {
+					wires.lock(
+						[](auto& vec) {
+							std::erase_if(vec,
+								[](gef::unique_ref<WIRE> const& w) {
+									return w->tcp_socket.socket.is_open();
+								});
+						});
+				}).detach();
+		}
 
-		} while (!m_outQ.pop_check_empty());
+		DequeueTCP();
+	}
+
+	void DequeueUDP() noexcept {
+	
+		gef::unique_ref<PacketUDP> p{ nullptr };
+
+		out_queue_udp.wait_dequeue(p);
+
+		if (not running) {
+			return;
+		}
+
+		std::shared_ptr shared_packet{ std::move(p._Ptr) };
+
+		bool clear_dead_wires = false;
+
+		wires.shared_lock(
+			[&](auto& vec) {
+
+				if (shared_packet->h.from_id == m_host_id) { // host isn't a wire, no need to check id
+					for (gef::unique_ref<WIRE> const& wire : vec) {
+						wire->udp_socket.Send(shared_packet);
+					}
+				}
+				else {
+					for (gef::unique_ref<WIRE> const& wire : vec) {
+
+						if (wire->id() == shared_packet->h.from_id) { // don't send back to the sender
+							continue;
+						}
+
+						wire->udp_socket.Send(shared_packet);
+					}
+				}
+			});
+
+		DequeueUDP();
 	}
 
 	/// Start accepting new connections.
-	void AcceptConnections() {
+	void AcceptConnections() noexcept {
 
-		m_acceptor.async_accept([this](asio::error_code ec, tcp::socket temp_sock) {
-			if (ec) {
-				static_cast<UserHost&>(*this).on_failed_connection_request(ec);
-			}
-			else {
-				if (!wires.is_full()) {
-					(new WIRE{ std::move(temp_sock) })->ReadClientInfo();
+		m_acceptor.async_accept(
+			[this](asio::error_code ec, tcp::socket temp_sock) {
+				if (ec) {
+					access_hoster().on_error({ net_error::failed_to_connect, ec });
 				}
 				else {
-
-					auto socket_heap = std::make_unique<tcp::socket>( std::move(temp_sock) );
-
-					auto h = std::make_unique<header>(0, net_enum::net_server_full);
-
-					auto Ph = h.get();
-					auto Psocket_heap = socket_heap.get();
-					
-					asio::async_write(*Psocket_heap, Ph->to_const_buf(),
-						[h = std::move(h), sh = std::move(socket_heap)](asio::error_code ec, size_t) {});
+					WIRE::Init(m_context, std::move(temp_sock));
 				}
-			}
 
-			AcceptConnections(); // continue to accept
-
+				AcceptConnections();
 			});
+	}
+
+private:
+
+	constexpr Hoster& access_hoster() noexcept {
+		return static_cast<Hoster&>(*this);
 	}
 };
 

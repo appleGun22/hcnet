@@ -10,7 +10,7 @@ public:
 	using HostInfo = host_info;
 
 	Hoster(const u16 port, const i32 max_connections)
-		: HOST(port, max_connections, *this), clients(max_connections + 1), host_id(max_connections)
+		: HOST(port, max_connections, this), clients(max_connections + 1), host_id(max_connections)
 	{}
 
 	dual_vector<client_info> clients;
@@ -19,49 +19,66 @@ public:
 
 public:
 
-	void on_any_error(const std::error_code& ec, const u32 id) const {
-		println("[{}] ERROR({}[{}]): {}", clients[id].name, ec.category().name(), ec.value(), ec.message());
+	void on_error(const net::error_info& err) const {
+		using enum net::net_error;
+
+		const std::string desc = 
+		[&]() -> std::string {
+			switch (err.what) {
+				case unknown_msg_type: {
+					return "";
+				}
+				case failed_connection_request: {
+					return "A request to establish connection has failed.";
+				}
+				case failed_to_run_io_context: {
+					return "";
+				}
+			}
+		}();
+
+		println("(system) ERROR: {}\n(EC {}: {})", desc, err.ec.value(), err.ec.message());
 	}
 
-	void on_failed_connection_request(const std::error_code& ec) const {
-		println("[system] A request to establish connection has failed. ERROR({}): {}", ec.value(), ec.message());
-	}
+	void on_client_dis(const i32 id, const tl::optional<net::error_info>& err) {
+		if (err.has_value()) {
+			on_error(err.value());
+		}
 
-	void on_client_dis(const i32 id, const std::error_code& ec) {
-		println("[{}] disconnected. {}", clients[id].name, ec.value());
+		println("(system) [{}] disconnected.", clients[id].name);
 
 		auto h = std::make_unique<net::header>(0, msg_t::net_client_disconnect, id);
 
-		Send(std::move(h), nullptr);
+		Send(std::make_unique<net::PACKET>(std::move(h), nullptr));
 
 		clients.erase(id);
 	}
 
-	bool filter_client_info(const net::IS_NET_MSG* new_cinfo) {
-		const auto& cinfo = static_cast<const net::msg<client_info>*>(new_cinfo)->base;
+	bool new_client(const net::IS_NET_MSG* new_cinfo) {
+		const auto& cinfo = *static_cast<const net::msg<client_info>*>(new_cinfo);
 
-		bool names_match =
+		bool name_duplicate =
 			clients.for_each_if(
-			[&cinfo](const auto& ci) {
-				return ci.name == cinfo.name;
+			[&](const auto& ci) {
+				return ci.name == cinfo->name;
 			});
 
-		if (!names_match) {
+		if (!name_duplicate) {
 			return true;
 		}
 
-		println("[system] A client has tried to join the session with an existing name. ({})", cinfo.name);
+		println("(system) A client has tried to join the session with an existing name. ({})", cinfo->name);
 		return false;
 	}
 
-	std::unique_ptr<net::IS_NET_MSG> builder(const net::header& h) {
+	std::unique_ptr<net::IS_NET_MSG> builder(const net::header& h) const {
 		switch (h.msg_type) {
-		case msg_t::net_new_client:
-			return std::make_unique<net::msg<client_info>>(h.size);
-		case msg_t::chat_msg:
-			return std::make_unique<net::msg<chat_msg>>(h.size);
-		default:
-			return nullptr;
+			case msg_t::net_new_client:
+				return std::make_unique<net::msg<client_info>>(h.size);
+			case msg_t::chat_msg:
+				return std::make_unique<net::msg<chat_msg>>(h.size);
+			default:
+				return nullptr;
 		}
 	}
 
@@ -70,28 +87,28 @@ public:
 		auto& h = *p->h;
 
 		switch (h.msg_type) {
-		case msg_t::net_new_client: {
-			client_info& m = static_cast<net::msg<client_info>*>(p->m.get())->base;
+			case msg_t::net_new_client: {
+				client_info& m = **static_cast<net::msg<client_info>*>(p->m.get());
 
-			const auto& cinfo = clients.insert(w.id(), std::move(m));
-			println("({}) joined the session.", cinfo.name);
+				const auto& cinfo = clients.insert(w.id(), std::move(m));
+				println("({}) joined the session.", cinfo.name);
 
-			p->m = std::make_unique<net::msg_ref<client_info>>(cinfo);
-			h.from_id = w.id();
+				p->m = std::make_unique<net::msg_ref<client_info>>(cinfo);
+				h.from_id = w.id();
 
-			Send(std::move(p), &w);
-			break;
-		}
-		case msg_t::chat_msg: {
-			const chat_msg& m = static_cast<net::msg<chat_msg>*>(p->m.get())->base;
+				Send(std::move(p), &w);
+				break;
+			}
+			case msg_t::chat_msg: {
+				const chat_msg& m = **static_cast<net::msg<chat_msg>*>(p->m.get());
 
-			println("[{}]: {}", clients[w.id()].name, m.text);
+				println("[{}]: {}", clients[w.id()].name, m.text);
 
-			h.from_id = w.id();
+				h.from_id = w.id();
 
-			Send(std::move(p), &w);
-			break;
-		}
+				Send(std::move(p), &w);
+				break;
+			}
 		}
 	}
 };
@@ -102,6 +119,7 @@ static std::error_code setup_upnp() {
 	bool configure_wifi{ 0 };
 	str answer;
 
+	println("!!! CONFIGURE UPNP TO USE UDP TOO !!!");
 	print("[system] Configure WIFI? (y/n): ");
 	std::getline(std::cin, answer);
 
@@ -184,15 +202,14 @@ int main() {
 
 	while (1) {
 		auto m = std::make_unique<net::msg<chat_msg>>();
-		auto& msg = m->base;
 
-		std::getline(std::cin, msg.text);
+		std::getline(std::cin, (*m)->text);
 
-		if (std::all_of(msg.text.begin(), msg.text.end(), isspace)) { // if only whitespaces
+		if (std::all_of((*m)->text.begin(), (*m)->text.end(), isspace)) { // if only whitespaces
 			continue;
 		}
 
-		auto h = std::make_unique<net::header>(msg.text_size(), msg_t::chat_msg, host.host_id);
-		host.Send(std::move(h), std::move(m));
+		auto h = std::make_unique<net::header>((*m)->text_size(), msg_t::chat_msg, host.host_id);
+		host.Send(std::make_unique<net::PACKET>(std::move(h), std::move(m)));
 	}
 }

@@ -36,7 +36,7 @@ public:
 		println("~~~\n");
 	}
 
-	std::unique_ptr<net::IS_NET_MSG> builder(const net::header& h) {
+	std::unique_ptr<net::IS_NET_MSG> builder(const net::header& h) const {
 		switch (h.msg_type) {
 		case msg_t::net_new_client:
 			return std::make_unique<net::msg<client_info>>(h.size);
@@ -52,13 +52,13 @@ public:
 
 		switch (h.msg_type) {
 		case msg_t::chat_msg: {
-			const chat_msg& m = static_cast<net::msg<chat_msg>*>(p->m.get())->base;
+			const chat_msg& m = **static_cast<net::msg<chat_msg>*>(p->m.get());
 
 			println("[{}]: {}", clients[h.from_id].name, m.text);
 			break;
 		}
 		case msg_t::net_new_client: {
-			client_info& m = static_cast<net::msg<client_info>*>(p->m.get())->base;
+			client_info& m = **static_cast<net::msg<client_info>*>(p->m.get());
 
 			const auto& cinfo = clients.insert(h.from_id, std::move(m));
 			println("({}) joined the session.", cinfo.name);
@@ -81,49 +81,50 @@ public:
 	
 };
 
+void setup(Clienter& client) {
+	str ip;
+
+	do {
+		print("[system] Coin: ");
+		std::getline(std::cin, ip);
+
+		ip = melt_coin(ip);
+	} while (ip == "");
+
+	str name;
+
+	do {
+		print("[system] Name: ");
+		std::getline(std::cin, name);
+	} while (name.size() > MAX_NAME_SIZE);
+
+	client.my_cinfo.name = name;
+
+	auto m = std::make_unique<net::msg_ref<client_info>>(client.my_cinfo);
+	auto h = std::make_unique<net::header>((*m)->size(), msg_t::net_new_client);
+	auto p = std::make_unique<net::PACKET>(std::move(h), std::move(m));
+
+	client.Start(ip, PORT, std::move(p));
+}
+
 int main() {
 
-	auto client = Clienter();
+	Clienter client;
 
-	{
-		str answer;
-
-		do {
-			print("[system] Name: ");
-			std::getline(std::cin, answer);
-		} while (answer.size() > MAX_NAME_SIZE);
-		client.my_cinfo.name = answer;
-
-		str ip;
-
-		do {
-			print("[system] Coin: ");
-			std::getline(std::cin, answer);
-
-			ip = melt_coin(answer);
-		} while (ip == "");
-
-		auto m = std::make_unique<net::msg_ref<client_info>>(client.my_cinfo);
-		auto h = std::make_unique<net::header>(m->base.size(), msg_t::net_new_client);
-
-		auto p = std::make_unique<net::PACKET>(std::move(h), std::move(m));
-
-		client.Start(ip, PORT, std::move(p));
-	}
+	setup(client);
 
 	println("[system] Client is ready.\n");
 
 	while (1) {
 		auto m = std::make_unique<net::msg<chat_msg>>();
-		auto& cm = m->base;
 
-		std::getline(std::cin, cm.text);
+		std::getline(std::cin, (*m)->text);
 
-		if (std::all_of(cm.text.begin(), cm.text.end(), isspace)) { // if only whitespaces
+		if (std::all_of((*m)->text.begin(), (*m)->text.end(), isspace)) { // if only whitespaces
 			continue;
 		}
 
-		auto h = std::make_unique<net::header>(cm.text_size(), msg_t::chat_msg);
-		client.Send(std::move(h), std::move(m));
+		auto h = std::make_unique<net::header>((*m)->text_size(), msg_t::chat_msg);
+		client.Send(std::make_unique<net::PACKET>(std::move(h), std::move(m)));
 	}
 }

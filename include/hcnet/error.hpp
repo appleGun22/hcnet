@@ -4,7 +4,11 @@
 
 namespace net {
 	enum class net_error {
-		unknown_msg_type
+		unknown_msg_type,
+		failed_to_connect,
+		failed_to_run_io_context,
+		failed_to_read,
+		failed_to_write
 	};
 
 	enum class upnp_error {
@@ -17,36 +21,22 @@ namespace net {
 		unspecified
 	};
 
-	namespace _lib {
+	struct error_info {
+		net_error what;
+		gef::option<std::error_code&> ec;
+	};
 
-		class net_error_category : public std::error_category
-		{
-		public:
-			const char* name() const noexcept final {
-				return "net";
-			}
-
-			std::string message(int ev) const final {
-				switch (static_cast<net_error>(ev)) {
-				case net_error::unknown_msg_type:
-					return "Recieved a message of an unknown type";
-				default:
-					return "Unknown error code";
-				}
-			}
-		};
-
-
+	namespace detail {
 		// Upnp error codes
 
 		class upnp_error_category : public std::error_category
 		{
 		public:
-			const char* name() const noexcept final {
+			cstr name() const noexcept final {
 				return "upnp";
 			}
 
-			std::string message(int ev) const final {
+			std::string message(int ev) const noexcept final {
 				switch (static_cast<upnp_error>(ev)) {
 				case upnp_error::discover:
 					return "Couldn't discover UPnP devices on the network";
@@ -68,12 +58,9 @@ namespace net {
 
 		// builders
 
-		std::error_code make_ec_net(net_error e) {
-			return std::error_code{ static_cast<int>(e), net_error_category{} };
-		}
-
-		std::error_code make_ec_upnp(upnp_error e) {
-			return std::error_code{ static_cast<int>(e), upnp_error_category{} };
+		std::error_code make_ec_upnp(upnp_error e) noexcept {
+			static const upnp_error_category upnp_error{};
+			return std::error_code{ static_cast<int>(e), upnp_error };
 		}
 
 	}

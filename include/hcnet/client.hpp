@@ -1,178 +1,209 @@
 #pragma once
 
 #include "canyon.hpp"
+#include "socket.hpp"
 
 namespace net {
 
-	template <class UserClient>
-	class Client {
-	public:
+template <class Clienter>
+class Client {
+public:
 
-		Client() : socket(m_context) {}
+	using PacketTCP = packet_tcp<header_client_TCP>;
+	using PacketUDP = packet_udp<header_client_UDP>;
 
-		~Client() {
-			Stop();
-		}
+	using PacketTCPserver = packet_tcp<header_server_TCP>;
+	using PacketUDPserver = packet_udp<header_server_UDP>;
 
-	private:
-		asio::io_context m_context;
-		tcp::socket socket;
-		std::thread m_self_thread;
+	Client() noexcept :
+		connected(false),
+		tcp_socket(*this, m_context),
+		udp_socket(*this, m_context)
+	{}
 
-		tsQueueMini<std::unique_ptr<PACKET>> m_outQ;
+	~Client() noexcept {
+		Stop();
+	}
 
-	public:
+private:
 
-		void Start(const str& host_ip, const u16 port, std::unique_ptr<PACKET> clientInfo) {
-			tcp::resolver resolver(m_context);
-			tcp::resolver::results_type endpoints = resolver.resolve(host_ip, std::to_string(port));
+	friend SocketTCP<Client, gef::unique_ref, header_client_TCP, header_server_TCP>;
+	friend SocketUDP<Client, gef::unique_ref, header_client_UDP, header_server_UDP>;
 
-			asio::async_connect(socket, endpoints,
-				[this, clientInfo = std::move(clientInfo)](asio::error_code ec, tcp::endpoint endpoint) mutable {
-					if (ec) {
-						Cut_connection(ec);
-						return;
-					}
+	asio::io_context m_context;
+	std::thread m_self_thread;
 
-					WriteClientInfo(std::move(clientInfo));
-				});
+	SocketTCP<Client, gef::unique_ref, header_client_TCP, header_server_TCP> tcp_socket;
+	SocketUDP<Client, gef::unique_ref, header_client_UDP, header_server_UDP> udp_socket;
 
-			m_self_thread = std::thread([this]() { m_context.run(); });
-		}
+	bool connected;
 
-		// Stops the client.
-		// Call Start() to restart the client.
-		inline void Stop() noexcept {
-			if (!m_context.stopped()) { m_context.stop(); }
+public:
 
-			if (m_self_thread.joinable()) { m_self_thread.join(); }
-		}
+	void Start(std::string const& host_ip, const u16 port, gef::unique_ref<PacketTCP> cinfo) noexcept {
 
-		inline void Send(std::unique_ptr<header> h, std::unique_ptr<IS_NET_MSG> m) {
-			if (socket.is_open()) {
-				bool was_empty = m_outQ.empty();
-				m_outQ.emplace(std::make_unique<PACKET>(std::move(h), std::move(m)));
+		tcp::endpoint endpoint{ asio::ip::make_address(host_ip), port };
 
-				if (was_empty) {
-					Write();
-				}
-			}
-		}
-
-	private:
-
-		void Cut_connection(const asio::error_code& ec) noexcept {
-			if (socket.is_open()) {// maybe use shutdown() and check for asio::error::eof(?) in async read/write
-				socket.close();
-				static_cast<UserClient&>(*this).on_dis(ec);
-			}
-		}
-
-		void WriteClientInfo(std::unique_ptr<PACKET> clientInfo) {
-			auto ci = clientInfo.get();
-			asio::async_write(socket, ci->const_buf_seq(),
-				[this, clientInfo = std::move(clientInfo)](asio::error_code ec, size_t) {
-					if (ec) {
-						Cut_connection(ec);
-						return;
-					}
-
-					ReadHostInfo();
-				});
-		}
-
-		void ReadHostInfo() {
-			auto h = std::make_unique<header>();
-			auto Ph = h.get();
-
-			asio::async_read(socket, Ph->to_mut_buf(),
-				[this, h = std::move(h)](asio::error_code ec, size_t) {
-					if (ec) {
-						Cut_connection(ec);
-						return;
-					}
-					
-					auto hinfo = std::make_unique<typename UserClient::HostInfo>();
-					auto Phinfo = hinfo.get();
-
-					asio::async_read(socket, Phinfo->custom_mut_buf(h->size),
-						[this, hinfo = std::move(hinfo)](asio::error_code ec, size_t) mutable {
-							if (ec) {
-								Cut_connection(ec);
-								return;
-							}
-
-							static_cast<UserClient&>(*this).handle_host_info(std::move(hinfo));
-							ReadHeader();
-						});
-				});
-		}
-
-		void ReadHeader() {
-			auto p = std::make_unique<PACKET>();
-			auto Pp = p.get();
-
-			asio::async_read(socket, Pp->h->to_mut_buf(),
-				[this, p = std::move(p)](asio::error_code ec, size_t) mutable {
-					if (ec) {
-						Cut_connection(ec);
-						return;
-					}
-					
-					if (p->h->size == 0) {
-						static_cast<UserClient&>(*this).new_msg(std::move(p));
-
-						ReadHeader();
-					}
-					else {
-						p->m = std::move(static_cast<UserClient&>(*this).builder(*p->h));
-
-						if (p->m == nullptr) {
-							Cut_connection(_lib::make_ec_net(net_error::unknown_msg_type));
-						}
-
-						ReadBody(std::move(p));
-					}
-				});
-		}
-
-		void ReadBody(std::unique_ptr<PACKET> p) {
-			auto Pp = p.get();
-
-			asio::async_read(socket, Pp->m->custom_mut_buf(),
-				[this, p = std::move(p)](asio::error_code ec, size_t) mutable {
-					if (ec) {
-						Cut_connection(ec);
-						return;
-					}
-					
-					ReadHeader();
-					static_cast<UserClient&>(*this).new_msg(std::move(p));
-				});
-		}
-
-		void Write() {
-			const std::unique_ptr<PACKET>& _msg = m_outQ.front();
-
-			auto f =
-			[this](asio::error_code ec, size_t) {
+		tcp_socket.socket.async_connect(endpoint,
+			[this, cinfo = std::move(cinfo)](asio::error_code ec) mutable {
 				if (ec) {
-					Cut_connection(ec);
+					access_clienter().on_error({ net::net_error::failed_to_connect, ec });
 					return;
 				}
 
-				if (!m_outQ.pop_check_empty()) {
-					Write();
-				}
-			};
+				auto const& local_endpoint = tcp_socket.socket.local_endpoint();
+				auto const& remote_endpoint = tcp_socket.socket.remote_endpoint();
 
-			if (_msg->m == nullptr) { // empty message, only header will be sent
-				asio::async_write(socket, _msg->h->to_const_buf(), f);
-			}
-			else {
-				asio::async_write(socket, _msg->const_buf_seq(), f);
-			}
+				ec = udp_socket.OpenBindConnect(
+					udp::endpoint(local_endpoint.address(), local_endpoint.port()),
+					udp::endpoint(remote_endpoint.address(), remote_endpoint.port())
+				);
+
+				if (ec) {
+					access_clienter().on_error({ net::net_error::failed_to_connect, ec });
+					return;
+				}
+
+				CinfoWrite(std::move(cinfo));
+			});
+
+
+		// actually start
+		m_self_thread = std::thread(
+			[this]() {
+				asio::error_code ec;
+				m_context.run(ec);
+
+				if (ec) {
+					access_clienter().on_error({ net_error::failed_to_run_io_context, ec });
+				}
+			});
+	}
+
+	// Stops the client.
+	// Call Start() to restart the client.
+	void Stop() noexcept {
+		if (not m_context.stopped()) { m_context.stop(); }
+
+		if (m_self_thread.joinable()) { m_self_thread.join(); }
+	}
+
+	constexpr bool is_connected() const noexcept {
+		return connected;
+	}
+
+	constexpr void Send(gef::unique_ref<PacketTCP> p) noexcept {
+		tcp_socket.Send(std::move(p));
+	}
+
+	constexpr void Send(gef::unique_ref<PacketUDP> p) noexcept {
+		udp_socket.Send(std::move(p));
+	}
+
+private:
+
+	constexpr gef::option<gef::unique_ref<any_msg>> builder_TCP(header_server_TCP const& h) noexcept {
+		return access_clienter().builder_TCP(h);
+	}
+
+	constexpr gef::unique_ref<any_msg> builder_UDP(size_t size) noexcept {
+		return access_clienter().builder_UDP(size);
+	}
+
+	constexpr void NewPacketTCP(gef::unique_ref<PacketTCPserver>&& p) noexcept {
+		access_clienter().new_packet_TCP(std::forward<decltype(p)>(p));
+	}
+
+	constexpr bool NewPacketUDP(gef::unique_ref<PacketUDPserver>&& p) noexcept {
+		return access_clienter().new_packet_UDP(std::forward<decltype(p)>(p));
+	}
+
+	void Close(error_info const& err) noexcept {
+
+		if (tcp_socket.socket.is_open()) {
+			tcp_socket.socket.shutdown(tcp::socket::shutdown_both);
+			tcp_socket.socket.close();
+
+			udp_socket.socket.close(); // udp can just be closed
+
+			connected = false;
+
+			access_clienter().on_close_connection(
+				err.ec.and_then<error_info const&>( // ?? fails to deduce `U` (option<U>)
+					[&](auto const& ec) -> gef::option<error_info const&> {
+						return ec == asio::error::eof
+							? gef::nullopt
+							: gef::option<error_info const&>{ err };
+					}));
 		}
-	};
+	}
+
+private:
+
+	void CinfoWrite(gef::unique_ref<PacketTCP> cinfo) noexcept {
+		auto bufs = cinfo->const_buf_seq();
+
+		tcp_socket.socket.async_send(bufs,
+			[this, cinfo = std::move(cinfo)](asio::error_code ec, size_t) {
+				if (ec) {
+					Close({ net_error::failed_to_write, ec });
+					return;
+				}
+
+				HinfoReadHeader();
+			});
+	}
+
+	void HinfoReadHeader() noexcept {
+		auto p = gef::unique_ref<PacketTCPserver>::make();
+
+		auto buf = header_to<mut_buf>(p->h);
+
+		tcp_socket.socket.async_receive(buf,
+			[this, p = std::move(p)](asio::error_code ec, size_t) mutable {
+				if (ec) {
+					Close({ net_error::failed_to_read, ec });
+					return;
+				}
+
+				p->m.replace(access_clienter().connection_result_builder(p->h))
+					.map_or_else(
+						[&](gef::unique_ref<any_msg>& m) {
+							HinfoReadBody(std::move(p), m.get());
+						},
+						[&]() {
+							Close({ net_error::unknown_msg_type, gef::nullopt });
+						});
+			});
+	}
+
+	void HinfoReadBody(gef::unique_ref<PacketTCPserver> p, any_msg& m) noexcept {
+
+		auto bufs = m.mut_buf_seq();
+
+		tcp_socket.socket.async_receive(bufs,
+			[this, p = std::move(p)](asio::error_code ec, size_t) mutable {
+				if (ec) {
+					Close({ net_error::failed_to_read, ec });
+					return;
+				}
+
+				if (not access_clienter().connection_result(std::move(p))) {
+					return;
+				}
+
+				connected = true;
+
+				tcp_socket.Start();
+				udp_socket.Start();
+			});
+	}
+
+private:
+
+	constexpr Clienter& access_clienter() noexcept {
+		return static_cast<Clienter&>(*this);
+	}
+};
 
 }
